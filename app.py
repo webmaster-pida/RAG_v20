@@ -45,7 +45,7 @@ def get_clients():
             clients['storage'] = storage.Client()
             
             # Embedding: Mantenemos el que definimos antes (o text-embedding-004 si prefieres)
-            clients['embedding'] = VertexAIEmbeddings(model_name="gemini-embedding-001")
+            clients['embedding'] = VertexAIEmbeddings(model_name="gemini-embedding-001", output_dimensionality=2048)
             
             # LLM: Usamos la variable definida
             logger.info(f"Usando modelo LLM: {MODEL_NAME}")
