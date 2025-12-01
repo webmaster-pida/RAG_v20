@@ -3,6 +3,8 @@ import io
 import traceback
 import logging
 import tempfile
+import warnings
+warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
 from flask import Flask, request, jsonify
 from pypdf import PdfReader
 from typing import Dict, Any
