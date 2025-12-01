@@ -5,58 +5,47 @@ import logging
 import tempfile
 import warnings
 
-# Filtramos la advertencia de storage para limpiar logs
+# Filtramos advertencias de librerías
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
 
 from flask import Flask, request, jsonify
-from pypdf import PdfReader
 from typing import Dict, Any, List
 
 # LangChain y Google
 import vertexai
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings  # <--- Importante para la clase custom
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.embeddings import Embeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_google_firestore import FirestoreVectorStore
 from langchain_google_vertexai import ChatVertexAI
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK Nativo de Vertex (Bypass para el error de Pydantic)
+# SDK Nativo de Vertex (Bypass para 2048 dimensiones)
 from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 
-# Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 clients = {}
 
-COLLECTION_NAME = "pdf_embeded_documents"
+COLLECTION_NAME = "pida_knowledge_base_v1" # Nombre nuevo sugerido para la nueva estructura
 
-# --- CLASE CUSTOM PARA SOLUCIONAR EL ERROR DE DEPENDENCIAS ---
+# --- CLASE CUSTOM (Mantenemos el fix de dimensiones) ---
 class CustomGeminiEmbeddings(Embeddings):
-    """
-    Wrapper personalizado para Gemini Embeddings que soporta output_dimensionality
-    sin depender de la versión de langchain-google-vertexai.
-    """
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
         self.model_name = model_name
         self.dimensionality = dimensionality
-        # Cargamos el modelo usando el SDK nativo, que sí soporta la función
         self.client = TextEmbeddingModel.from_pretrained(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # Vertex AI procesa mejor en lotes pequeños (ej. 100), pero aquí hacemos
-        # una implementación simple. El SDK maneja la paginación interna a veces.
         embeddings = []
-        # Procesamos en mini-baches de 20 para evitar límites de la API nativa
         batch_size = 20
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             inputs = [TextEmbeddingInput(text, "RETRIEVAL_DOCUMENT") for text in batch]
             try:
-                # AQUÍ está la clave: pasamos output_dimensionality directamente al SDK
                 results = self.client.get_embeddings(inputs, output_dimensionality=self.dimensionality)
                 embeddings.extend([embedding.values for embedding in results])
             except Exception as e:
@@ -74,93 +63,110 @@ class CustomGeminiEmbeddings(Embeddings):
 def get_clients():
     global clients
     if 'firestore' not in clients:
-        logger.info("--- Inicializando clientes de Google Cloud... ---")
+        logger.info("--- Inicializando clientes... ---")
         try:
             PROJECT_ID = os.environ.get("PROJECT_ID")
             VERTEX_AI_LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
             
-            # Inicializar SDK
             vertexai.init(project=PROJECT_ID, location=VERTEX_AI_LOCATION)
             
             clients['firestore'] = firestore.Client()
             clients['storage'] = storage.Client()
             
-            # CAMBIO CRÍTICO: Usamos nuestra clase custom en lugar de VertexAIEmbeddings
-            # Esto nos garantiza 2048 dimensiones sin errores de validación
-            logger.info("Inicializando CustomGeminiEmbeddings (2048 dim)...")
+            # Usamos el wrapper custom para 2048 dimensiones
             clients['embedding'] = CustomGeminiEmbeddings(
                 model_name="gemini-embedding-001",
                 dimensionality=2048
             )
             
+            # Modelo de Chat
             MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             logger.info(f"Usando modelo LLM: {MODEL_NAME}")
             clients['llm'] = ChatVertexAI(model_name=MODEL_NAME) 
             
-            logger.info("--- Clientes inicializados correctamente. ---")
+            logger.info("--- Clientes inicializados. ---")
         except Exception as e:
-            logger.error(f"--- !!! ERROR CRÍTICO inicializando clientes: {e} ---", exc_info=True)
+            logger.error(f"ERROR CRÍTICO inicializando: {e}", exc_info=True)
             clients = {}
     return clients
 
-def _process_and_embed_pdf_file(file_path: str, filename: str) -> Dict[str, Any]:
+def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any]:
     try:
-        logger.info(f"Iniciando procesamiento para el archivo: {filename}")
+        logger.info(f"Procesando archivo de texto: {filename}")
         clients_local = get_clients()
         firestore_client = clients_local.get('firestore')
         embedding_model = clients_local.get('embedding')
         
         if not firestore_client or not embedding_model:
-            raise Exception("Clientes de GCP no disponibles.")
+            raise Exception("Clientes GCP no disponibles.")
         
-        # Verificar duplicados
+        # Verificar si ya existe
         docs_ref = firestore_client.collection(COLLECTION_NAME)
         existing_docs = docs_ref.where(filter=FieldFilter("metadata.source", "==", filename)).limit(1).stream()
-        
         if len(list(existing_docs)) > 0:
-            logger.info(f"El archivo '{filename}' ya existe. Saltando...")
-            return {"status": "skipped", "message": "Archivo ya procesado."}
+            return {"status": "skipped", "message": "Archivo ya existe en la base de datos."}
 
-        reader = PdfReader(file_path)
-        text_content = "".join(page.extract_text() for page in reader.pages if page.extract_text())
+        # 1. LEER TEXTO PLANO
+        # Asumimos que el archivo viene en UTF-8
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            text_content = f.read()
         
         if not text_content:
-            return {"status": "error", "reason": "No se pudo extraer texto del PDF."}
+            return {"status": "error", "reason": "El archivo está vacío."}
 
-        pdf_meta = reader.metadata
-        book_title = pdf_meta.title if pdf_meta and pdf_meta.title else os.path.splitext(filename)[0].replace("_", " ").title()
-        book_author = pdf_meta.author if pdf_meta and pdf_meta.author else "Autor Desconocido"
+        # 2. PROCESAMIENTO INTELIGENTE (MARKDOWN AWARE)
+        # Si usas Markdown, esto ayuda a dividir por encabezados antes que por caracteres
+        headers_to_split_on = [
+            ("#", "Header 1"),
+            ("##", "Header 2"),
+            ("###", "Header 3"),
+        ]
         
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-        chunks = text_splitter.split_text(text_content)
+        # Primero intentamos dividir por estructura lógica MD
+        markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+        md_header_splits = markdown_splitter.split_text(text_content)
+
+        # Luego dividimos por caracteres para respetar el tamaño de contexto
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=2000, 
+            chunk_overlap=200,
+            separators=["\n\n", "\n", " ", ""] # Prioriza cortar en párrafos
+        )
         
+        # Si el archivo no tenía headers MD, md_header_splits contendrá el texto completo como 1 doc
+        chunks = text_splitter.split_documents(md_header_splits)
+        
+        # Preparar documentos para Firestore
         documents = []
         for i, chunk in enumerate(chunks):
+            # Preservar metadatos que vengan del splitter MD (ej: {'Header 1': 'Introducción'})
+            meta = chunk.metadata.copy()
+            meta.update({
+                "source": filename,
+                "chunk_index": i,
+                "model": "gemini-embedding-001"
+            })
+            
             doc = Document(
-                page_content=chunk,
-                metadata={ 
-                    "source": filename, 
-                    "chunk_index": i, 
-                    "title": book_title, 
-                    "author": book_author
-                }
+                page_content=chunk.page_content,
+                metadata=meta
             )
             documents.append(doc)
         
+        # 3. GUARDAR
         vector_store = FirestoreVectorStore(
             collection=COLLECTION_NAME, embedding_service=embedding_model, client=firestore_client
         )
         
-        # Loteamos la subida a Firestore
         batch_size = 50 
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
             vector_store.add_documents(batch)
-            logger.info(f"Lote {i//batch_size + 1} insertado en Firestore.")
+            logger.info(f"Lote {i//batch_size + 1} guardado.")
         
-        return {"status": "ok", "message": f"Archivo {filename} procesado con éxito."}
+        return {"status": "ok", "message": f"Archivo {filename} procesado ({len(documents)} chunks)."}
     except Exception as e:
-        logger.error(f"Error procesando PDF: {e}", exc_info=True)
+        logger.error(f"Error procesando Texto/MD: {e}", exc_info=True)
         return {"status": "error", "reason": str(e)}
 
 @app.route("/", methods=["POST"])
@@ -174,29 +180,33 @@ def handle_gcs_event():
         if not event: return "Sin body", 400
 
         bucket_name = event.get("bucket")
-        file_id = event.get("name")
+        file_id = event.get("name") # ej: "carpeta/documento.md"
         
         if not bucket_name or not file_id: return "Evento ignorado", 200
+
+        # FILTRO: Solo procesar .txt o .md (opcional)
+        if not (file_id.endswith(".txt") or file_id.endswith(".md")):
+            logger.info(f"Archivo {file_id} ignorado (no es txt/md).")
+            return "Formato no soportado", 200
 
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_id)
         
-        if not blob.exists(): return "Archivo no encontrado", 200
-        if blob.size == 0: return "Archivo vacío", 200
+        if not blob.exists() or blob.size == 0: return "Archivo inválido", 200
 
-        # Archivo temporal para evitar OOM
-        with tempfile.NamedTemporaryFile(delete=False) as temp_pdf:
-            blob.download_to_filename(temp_pdf.name)
-            temp_pdf.close()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp_file:
+            blob.download_to_filename(temp_file.name)
+            temp_file.close()
             try:
-                result = _process_and_embed_pdf_file(temp_pdf.name, file_id)
+                # Llamamos a la nueva función de texto
+                result = _process_and_embed_text_file(temp_file.name, file_id)
             finally:
-                if os.path.exists(temp_pdf.name): os.unlink(temp_pdf.name)
+                if os.path.exists(temp_file.name): os.unlink(temp_file.name)
 
         return jsonify(result), 200
 
     except Exception as e:
-        logger.error(f"Error inesperado en handler: {e}", exc_info=True)
+        logger.error(f"Error handler: {e}", exc_info=True)
         return f"Error: {str(e)}", 500
 
 @app.route("/query", methods=["POST"])
@@ -204,7 +214,7 @@ def query_rag_handler():
     try:
         request_data = request.get_json()
         if not request_data or "query" not in request_data:
-             return jsonify({"error": "Falta el campo 'query'"}), 400
+             return jsonify({"error": "Falta query"}), 400
              
         user_query = request_data["query"]
         clients_local = get_clients()
@@ -217,29 +227,45 @@ def query_rag_handler():
         
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        llm = clients_local.get('llm')
-        context_text = "\n\n".join([doc.page_content for doc in found_docs])
+        # Construir contexto con metadatos explícitos para que el LLM sepa qué citar
+        context_parts = []
+        for doc in found_docs:
+            source = doc.metadata.get("source", "Documento Desconocido")
+            # Incluimos el contenido con una etiqueta clara de su fuente
+            context_parts.append(f"--- INICIO FUENTE: {source} ---\n{doc.page_content}\n--- FIN FUENTE ---")
+            
+        context_text = "\n\n".join(context_parts)
         
-        prompt = f"""Eres un asistente útil y preciso. Responde a la pregunta basándote SOLO en el siguiente contexto:
+        # --- PROMPT OPTIMIZADO PARA CITAS ---
+        prompt = f"""Instrucciones: Eres un asistente experto que responde preguntas basándose estrictamente en el contexto proporcionado.
         
+        REGLAS DE CITA (IMPORTANTE):
+        1.  Cada vez que afirmes algo basado en el contexto, DEBES incluir la cita exacta al final de la frase.
+        2.  El formato de la cita debe ser:.
+        3.  El nombre del archivo está indicado en el contexto como "--- INICIO FUENTE: nombre_del_archivo ---".
+        4.  Si la respuesta se construye de múltiples fuentes, cita todas ellas.
+        5.  Si la información no está en el contexto, di "No tengo información suficiente en los documentos proporcionados".
+
         CONTEXTO:
-        {context_text}
+        {context_content}
         
-        PREGUNTA:
+        PREGUNTA DEL USUARIO:
         {user_query}
         """
         
+        # Pequeño fix: definimos context_content para el f-string arriba
+        prompt = prompt.replace("{context_content}", context_text)
+        
+        llm = clients_local.get('llm')
         ai_response = llm.invoke(prompt)
 
+        # Devolvemos también los chunks usados para depuración en frontend
         results = []
         for doc in found_docs:
-            meta = doc.metadata
-            result_item = {
-                "source": meta.get("source"),
-                "title": meta.get("title"),
+            results.append({
+                "source": doc.metadata.get("source"),
                 "content": doc.page_content
-            }
-            results.append(result_item)
+            })
         
         return jsonify({
             "answer": ai_response.content,
@@ -247,7 +273,7 @@ def query_rag_handler():
         }), 200
 
     except Exception as e:
-        logger.error(f"Error en query: {e}", exc_info=True)
+        logger.error(f"Error query: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
