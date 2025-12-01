@@ -1,0 +1,10 @@
+Flask>=3.0.0
+gunicorn>=21.2.0
+pypdf>=4.0.0
+langchain-core>=0.1.50
+langchain-text-splitters>=0.0.1
+langchain-google-firestore>=0.1.2
+langchain-google-vertexai>=1.0.3
+google-cloud-aiplatform>=1.50.0
+google-cloud-firestore>=2.11.0
+google-cloud-storage>=2.8.0
