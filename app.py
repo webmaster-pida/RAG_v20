@@ -4,19 +4,26 @@ import traceback
 import logging
 import tempfile
 import warnings
+
+# Filtramos la advertencia de storage para limpiar logs
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
+
 from flask import Flask, request, jsonify
 from pypdf import PdfReader
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # LangChain y Google
 import vertexai
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings  # <--- Importante para la clase custom
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_firestore import FirestoreVectorStore
-from langchain_google_vertexai import VertexAIEmbeddings, ChatVertexAI
+from langchain_google_vertexai import ChatVertexAI
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
+
+# SDK Nativo de Vertex (Bypass para el error de Pydantic)
+from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 
 # Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,8 +32,44 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 clients = {}
 
-# Nombre de la colección en Firestore
-COLLECTION_NAME = "pdf_embeded_documents" 
+COLLECTION_NAME = "pdf_embeded_documents"
+
+# --- CLASE CUSTOM PARA SOLUCIONAR EL ERROR DE DEPENDENCIAS ---
+class CustomGeminiEmbeddings(Embeddings):
+    """
+    Wrapper personalizado para Gemini Embeddings que soporta output_dimensionality
+    sin depender de la versión de langchain-google-vertexai.
+    """
+    def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
+        self.model_name = model_name
+        self.dimensionality = dimensionality
+        # Cargamos el modelo usando el SDK nativo, que sí soporta la función
+        self.client = TextEmbeddingModel.from_pretrained(model_name)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # Vertex AI procesa mejor en lotes pequeños (ej. 100), pero aquí hacemos
+        # una implementación simple. El SDK maneja la paginación interna a veces.
+        embeddings = []
+        # Procesamos en mini-baches de 20 para evitar límites de la API nativa
+        batch_size = 20
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            inputs = [TextEmbeddingInput(text, "RETRIEVAL_DOCUMENT") for text in batch]
+            try:
+                # AQUÍ está la clave: pasamos output_dimensionality directamente al SDK
+                results = self.client.get_embeddings(inputs, output_dimensionality=self.dimensionality)
+                embeddings.extend([embedding.values for embedding in results])
+            except Exception as e:
+                logger.error(f"Error generando embeddings nativos: {e}")
+                raise e
+        return embeddings
+
+    def embed_query(self, text: str) -> List[float]:
+        inputs = [TextEmbeddingInput(text, "RETRIEVAL_QUERY")]
+        results = self.client.get_embeddings(inputs, output_dimensionality=self.dimensionality)
+        return results[0].values
+
+# -----------------------------------------------------------
 
 def get_clients():
     global clients
@@ -36,20 +79,21 @@ def get_clients():
             PROJECT_ID = os.environ.get("PROJECT_ID")
             VERTEX_AI_LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
             
-            # --- AQUÍ ESTÁ EL CAMBIO ---
-            # Leemos la variable de entorno, con fallback a 2.5-flash si no existe
-            MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-            
-            # Inicializar Vertex AI
+            # Inicializar SDK
             vertexai.init(project=PROJECT_ID, location=VERTEX_AI_LOCATION)
             
             clients['firestore'] = firestore.Client()
             clients['storage'] = storage.Client()
             
-            # Embedding: Mantenemos el que definimos antes (o text-embedding-004 si prefieres)
-            clients['embedding'] = VertexAIEmbeddings(model_name="gemini-embedding-001", output_dimensionality=2048)
+            # CAMBIO CRÍTICO: Usamos nuestra clase custom en lugar de VertexAIEmbeddings
+            # Esto nos garantiza 2048 dimensiones sin errores de validación
+            logger.info("Inicializando CustomGeminiEmbeddings (2048 dim)...")
+            clients['embedding'] = CustomGeminiEmbeddings(
+                model_name="gemini-embedding-001",
+                dimensionality=2048
+            )
             
-            # LLM: Usamos la variable definida
+            MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             logger.info(f"Usando modelo LLM: {MODEL_NAME}")
             clients['llm'] = ChatVertexAI(model_name=MODEL_NAME) 
             
@@ -107,10 +151,12 @@ def _process_and_embed_pdf_file(file_path: str, filename: str) -> Dict[str, Any]
             collection=COLLECTION_NAME, embedding_service=embedding_model, client=firestore_client
         )
         
+        # Loteamos la subida a Firestore
         batch_size = 50 
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
             vector_store.add_documents(batch)
+            logger.info(f"Lote {i//batch_size + 1} insertado en Firestore.")
         
         return {"status": "ok", "message": f"Archivo {filename} procesado con éxito."}
     except Exception as e:
@@ -138,7 +184,7 @@ def handle_gcs_event():
         if not blob.exists(): return "Archivo no encontrado", 200
         if blob.size == 0: return "Archivo vacío", 200
 
-        # Uso de archivo temporal para evitar OOM
+        # Archivo temporal para evitar OOM
         with tempfile.NamedTemporaryFile(delete=False) as temp_pdf:
             blob.download_to_filename(temp_pdf.name)
             temp_pdf.close()
@@ -169,17 +215,12 @@ def query_rag_handler():
             client=clients_local.get('firestore')
         )
         
-        # Retrieval
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        # Generación (RAG) usando el modelo definido en variables de entorno
         llm = clients_local.get('llm')
-        
-        # Crear contexto a partir de los documentos encontrados
         context_text = "\n\n".join([doc.page_content for doc in found_docs])
         
-        # Prompt simple para RAG
-        prompt = f"""Eres un asistente útil. Responde a la pregunta basándote SOLO en el siguiente contexto:
+        prompt = f"""Eres un asistente útil y preciso. Responde a la pregunta basándote SOLO en el siguiente contexto:
         
         CONTEXTO:
         {context_text}
@@ -188,7 +229,6 @@ def query_rag_handler():
         {user_query}
         """
         
-        # Invocar al LLM (Gemini 2.5 Flash)
         ai_response = llm.invoke(prompt)
 
         results = []
@@ -197,7 +237,7 @@ def query_rag_handler():
             result_item = {
                 "source": meta.get("source"),
                 "title": meta.get("title"),
-                "content": doc.page_content # Opcional: devolver el chunk
+                "content": doc.page_content
             }
             results.append(result_item)
         
