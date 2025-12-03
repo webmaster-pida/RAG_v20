@@ -225,51 +225,23 @@ def query_rag_handler():
             client=clients_local.get('firestore')
         )
         
-        # Hacemos la búsqueda
+        # 1. Búsqueda Vectorial
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        # Construimos el texto del contexto
-        context_parts = []
-        for doc in found_docs:
-            source = doc.metadata.get("source", "Documento Desconocido")
-            context_parts.append(f"--- INICIO FUENTE: {source} ---\n{doc.page_content}\n--- FIN FUENTE ---")
-            
-        context_text = "\n\n".join(context_parts) # <--- Esta es la variable real
-        
-        # --- PROMPT CORREGIDO ---
-        # Usamos {context_text} directamente, que es la variable que sí existe.
-        prompt = f"""Instrucciones: Eres un asistente experto que responde preguntas basándose estrictamente en el contexto proporcionado.
-        
-        REGLAS DE CITA (IMPORTANTE):
-        1.  Cada vez que afirmes algo basado en el contexto, DEBES incluir la cita exacta al final de la frase.
-        2.  El formato de la cita debe ser: **(Fuente: nombre_archivo)**.
-        3.  El nombre del archivo está indicado en el contexto como "--- INICIO FUENTE: nombre_del_archivo ---".
-        4.  Si la respuesta se construye de múltiples fuentes, cita todas ellas.
-        5.  Si la información no está en el contexto, di "No tengo información suficiente en los documentos proporcionados".
-
-        CONTEXTO:
-        {context_text}
-        
-        PREGUNTA DEL USUARIO:
-        {user_query}
-        """
-        
-        # Eliminamos la línea .replace() que causaba confusión porque ya lo inyectamos arriba.
-        
-        llm = clients_local.get('llm')
-        ai_response = llm.invoke(prompt)
-
-        # Devolvemos también los chunks usados para depuración en frontend
+        # 2. Formatear resultados (NO generamos respuesta con LLM aquí para ahorrar tiempo)
         results = []
         for doc in found_docs:
             results.append({
-                "source": doc.metadata.get("source"),
-                "content": doc.page_content
+                "source": doc.metadata.get("source", "Desconocido"),
+                "content": doc.page_content,
+                "title": doc.metadata.get("title", None), # Opcional si lo tienes
+                "author": doc.metadata.get("author", None) # Opcional si lo tienes
             })
         
+        # 3. Devolver con la clave CORRECTA "results"
         return jsonify({
-            "answer": ai_response.content,
-            "sources": results
+            "results": results, # <--- ¡ESTO ARREGLA LA CONEXIÓN!
+            "count": len(results)
         }), 200
 
     except Exception as e:
