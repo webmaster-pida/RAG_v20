@@ -257,16 +257,25 @@ def query_rag_handler():
         
         results = []
         for i, doc in enumerate(found_docs):
-            meta = doc.metadata
+            # Obtenemos la metadata cruda
+            raw_meta = doc.metadata
             
-            # --- DEBUG LOGGING (Míralo en Cloud Run Logs) ---
-            logger.info(f"DOC {i} METADATA RAW: {meta}") 
-            # ------------------------------------------------
+            # --- CORRECCIÓN DE ANIDAMIENTO ---
+            # A veces Firestore devuelve los campos directamente, a veces dentro de una llave 'metadata'.
+            # Verificamos si existe un diccionario interno llamado 'metadata' y lo usamos.
+            inner_meta = raw_meta.get("metadata", {})
+            if isinstance(inner_meta, dict) and inner_meta:
+                # Si hay datos anidados, damos prioridad a esos
+                data_source = inner_meta
+            else:
+                # Si no, usamos el nivel superior
+                data_source = raw_meta
             
-            # Extraemos con seguridad y valores por defecto claros
-            doc_source = meta.get("source", "Desconocido")
-            doc_title = meta.get("title", meta.get("Title", doc_source)) # Intenta 'title', luego 'Title', luego el nombre de archivo
-            doc_author = meta.get("author", meta.get("Author", "Autor Desconocido"))
+            # Ahora extraemos los datos de la fuente correcta
+            doc_source = data_source.get("source", "Desconocido")
+            doc_title = data_source.get("title", data_source.get("Title", doc_source))
+            doc_author = data_source.get("author", data_source.get("Author", "Autor Desconocido"))
+            # ----------------------------------
 
             results.append({
                 "source": doc_source,
@@ -274,8 +283,6 @@ def query_rag_handler():
                 "title": doc_title,
                 "author": doc_author
             })
-        
-        logger.info(f"Devolviendo {len(results)} resultados al Chat.")
         
         return jsonify({
             "results": results, 
