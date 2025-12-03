@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import traceback
 import logging
 import tempfile
@@ -96,61 +97,86 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
         clients_local = get_clients()
         firestore_client = clients_local.get('firestore')
         embedding_model = clients_local.get('embedding')
+        llm = clients_local.get('llm') # Usaremos el LLM para extraer metadatos
         
         if not firestore_client or not embedding_model:
             raise Exception("Clientes GCP no disponibles.")
         
-        # Verificar si ya existe
+        # Verificar si ya existe (Opcional: podrías querer sobrescribir)
         docs_ref = firestore_client.collection(COLLECTION_NAME)
         existing_docs = docs_ref.where(filter=FieldFilter("metadata.source", "==", filename)).limit(1).stream()
         if len(list(existing_docs)) > 0:
+            logger.warning(f"El archivo {filename} ya existe. Saltando o podrías borrarlo aquí para re-indexar.")
             return {"status": "skipped", "message": "Archivo ya existe en la base de datos."}
 
         # 1. LEER TEXTO PLANO
-        # Asumimos que el archivo viene en UTF-8
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             text_content = f.read()
         
         if not text_content:
             return {"status": "error", "reason": "El archivo está vacío."}
 
-        # 2. PROCESAMIENTO INTELIGENTE (MARKDOWN AWARE)
-        # Si usas Markdown, esto ayuda a dividir por encabezados antes que por caracteres
-        headers_to_split_on = [
-            ("#", "Header 1"),
-            ("##", "Header 2"),
-            ("###", "Header 3"),
-        ]
+        # --- NUEVO: EXTRACCIÓN INTELIGENTE DE METADATOS ---
+        doc_title = filename
+        doc_author = "Desconocido"
         
-        # Primero intentamos dividir por estructura lógica MD
+        try:
+            # Tomamos una muestra del inicio donde suele estar el título/autor
+            sample_text = text_content[:3000]
+            
+            prompt_meta = f"""Eres un bibliotecario experto. Analiza el siguiente fragmento de texto y extrae el Título y el Autor.
+            
+            Reglas:
+            1. Si no encuentras el autor explícitamente, pon "Autor Desconocido".
+            2. Si no encuentras el título claro, usa: "{filename}".
+            3. Responde ÚNICAMENTE un JSON válido con este formato: {{"title": "...", "author": "..."}}
+            
+            TEXTO:
+            {sample_text}
+            """
+            
+            # Invocamos al modelo (ya inicializado en clients)
+            meta_response = llm.invoke(prompt_meta)
+            
+            # Limpiamos la respuesta para obtener solo el JSON
+            json_str = meta_response.content.replace("```json", "").replace("```", "").strip()
+            metadata_extracted = json.loads(json_str)
+            
+            doc_title = metadata_extracted.get("title", filename)
+            doc_author = metadata_extracted.get("author", "Autor Desconocido")
+            
+            logger.info(f"METADATOS EXTRAÍDOS: Título='{doc_title}', Autor='{doc_author}'")
+            
+        except Exception as e:
+            logger.warning(f"No se pudieron extraer metadatos con IA, usando defaults: {e}")
+        # ----------------------------------------------------
+
+        # 2. PROCESAMIENTO (SPLITTING)
+        headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
         markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
         md_header_splits = markdown_splitter.split_text(text_content)
 
-        # Luego dividimos por caracteres para respetar el tamaño de contexto
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=2000, 
             chunk_overlap=200,
-            separators=["\n\n", "\n", " ", ""] # Prioriza cortar en párrafos
+            separators=["\n\n", "\n", " ", ""]
         )
         
-        # Si el archivo no tenía headers MD, md_header_splits contendrá el texto completo como 1 doc
         chunks = text_splitter.split_documents(md_header_splits)
         
-        # Preparar documentos para Firestore
+        # Preparar documentos para Firestore CON LOS NUEVOS METADATOS
         documents = []
         for i, chunk in enumerate(chunks):
-            # Preservar metadatos que vengan del splitter MD (ej: {'Header 1': 'Introducción'})
             meta = chunk.metadata.copy()
             meta.update({
                 "source": filename,
+                "title": doc_title,   # <--- AQUI GUARDAMOS EL TÍTULO
+                "author": doc_author, # <--- AQUI GUARDAMOS EL AUTOR
                 "chunk_index": i,
                 "model": "gemini-embedding-001"
             })
             
-            doc = Document(
-                page_content=chunk.page_content,
-                metadata=meta
-            )
+            doc = Document(page_content=chunk.page_content, metadata=meta)
             documents.append(doc)
         
         # 3. GUARDAR
@@ -164,7 +190,8 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
             vector_store.add_documents(batch)
             logger.info(f"Lote {i//batch_size + 1} guardado.")
         
-        return {"status": "ok", "message": f"Archivo {filename} procesado ({len(documents)} chunks)."}
+        return {"status": "ok", "message": f"Archivo procesado: {doc_title} por {doc_author}"}
+        
     except Exception as e:
         logger.error(f"Error procesando Texto/MD: {e}", exc_info=True)
         return {"status": "error", "reason": str(e)}
