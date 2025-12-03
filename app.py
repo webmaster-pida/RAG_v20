@@ -225,36 +225,36 @@ def query_rag_handler():
             client=clients_local.get('firestore')
         )
         
+        # Hacemos la búsqueda
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        # Construir contexto con metadatos explícitos para que el LLM sepa qué citar
+        # Construimos el texto del contexto
         context_parts = []
         for doc in found_docs:
             source = doc.metadata.get("source", "Documento Desconocido")
-            # Incluimos el contenido con una etiqueta clara de su fuente
             context_parts.append(f"--- INICIO FUENTE: {source} ---\n{doc.page_content}\n--- FIN FUENTE ---")
             
-        context_text = "\n\n".join(context_parts)
+        context_text = "\n\n".join(context_parts) # <--- Esta es la variable real
         
-        # --- PROMPT OPTIMIZADO PARA CITAS ---
+        # --- PROMPT CORREGIDO ---
+        # Usamos {context_text} directamente, que es la variable que sí existe.
         prompt = f"""Instrucciones: Eres un asistente experto que responde preguntas basándose estrictamente en el contexto proporcionado.
         
         REGLAS DE CITA (IMPORTANTE):
         1.  Cada vez que afirmes algo basado en el contexto, DEBES incluir la cita exacta al final de la frase.
-        2.  El formato de la cita debe ser:.
+        2.  El formato de la cita debe ser: **(Fuente: nombre_archivo)**.
         3.  El nombre del archivo está indicado en el contexto como "--- INICIO FUENTE: nombre_del_archivo ---".
         4.  Si la respuesta se construye de múltiples fuentes, cita todas ellas.
         5.  Si la información no está en el contexto, di "No tengo información suficiente en los documentos proporcionados".
 
         CONTEXTO:
-        {context_content}
+        {context_text}
         
         PREGUNTA DEL USUARIO:
         {user_query}
         """
         
-        # Pequeño fix: definimos context_content para el f-string arriba
-        prompt = prompt.replace("{context_content}", context_text)
+        # Eliminamos la línea .replace() que causaba confusión porque ya lo inyectamos arriba.
         
         llm = clients_local.get('llm')
         ai_response = llm.invoke(prompt)
