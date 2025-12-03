@@ -255,19 +255,21 @@ def query_rag_handler():
         # 1. Búsqueda Vectorial
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        # 2. Formatear resultados (NO generamos respuesta con LLM aquí para ahorrar tiempo)
+        # 2. Formatear resultados incluyendo TÍTULO y AUTOR
         results = []
         for doc in found_docs:
+            # Extraemos los metadatos nuevos que guardamos en el paso anterior
+            meta = doc.metadata
             results.append({
-                "source": doc.metadata.get("source", "Desconocido"),
+                "source": meta.get("source", "Desconocido"),
                 "content": doc.page_content,
-                "title": doc.metadata.get("title", None), # Opcional si lo tienes
-                "author": doc.metadata.get("author", None) # Opcional si lo tienes
+                "title": meta.get("title", None),   # <--- ¡ESTO FALTABA!
+                "author": meta.get("author", None)  # <--- ¡ESTO FALTABA!
             })
         
-        # 3. Devolver con la clave CORRECTA "results"
+        # 3. Devolver la lista limpia al Chat
         return jsonify({
-            "results": results, # <--- ¡ESTO ARREGLA LA CONEXIÓN!
+            "results": results, 
             "count": len(results)
         }), 200
 
