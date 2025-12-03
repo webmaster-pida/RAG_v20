@@ -252,22 +252,31 @@ def query_rag_handler():
             client=clients_local.get('firestore')
         )
         
-        # 1. Búsqueda Vectorial
+        logger.info(f"Buscando documentos para: '{user_query}'")
         found_docs = vector_store.similarity_search(query=user_query, k=5)
         
-        # 2. Formatear resultados incluyendo TÍTULO y AUTOR
         results = []
-        for doc in found_docs:
-            # Extraemos los metadatos nuevos que guardamos en el paso anterior
+        for i, doc in enumerate(found_docs):
             meta = doc.metadata
+            
+            # --- DEBUG LOGGING (Míralo en Cloud Run Logs) ---
+            logger.info(f"DOC {i} METADATA RAW: {meta}") 
+            # ------------------------------------------------
+            
+            # Extraemos con seguridad y valores por defecto claros
+            doc_source = meta.get("source", "Desconocido")
+            doc_title = meta.get("title", meta.get("Title", doc_source)) # Intenta 'title', luego 'Title', luego el nombre de archivo
+            doc_author = meta.get("author", meta.get("Author", "Autor Desconocido"))
+
             results.append({
-                "source": meta.get("source", "Desconocido"),
+                "source": doc_source,
                 "content": doc.page_content,
-                "title": meta.get("title", None),   # <--- ¡ESTO FALTABA!
-                "author": meta.get("author", None)  # <--- ¡ESTO FALTABA!
+                "title": doc_title,
+                "author": doc_author
             })
         
-        # 3. Devolver la lista limpia al Chat
+        logger.info(f"Devolviendo {len(results)} resultados al Chat.")
+        
         return jsonify({
             "results": results, 
             "count": len(results)
