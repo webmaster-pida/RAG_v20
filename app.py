@@ -12,18 +12,18 @@ warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=F
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List
 
-# LangChain y Google
-import vertexai
+# LangChain y Google (Nuevas importaciones)
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_google_firestore import FirestoreVectorStore
-from langchain_google_vertexai import ChatVertexAI
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK Nativo de Vertex (Bypass para 2048 dimensiones)
-from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
+# SDK GenAI unificado y LangChain GenAI
+from google import genai
+from google.genai.types import EmbedContentConfig
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,57 +33,75 @@ clients = {}
 
 COLLECTION_NAME = "pida_knowledge_base_v1" # Nombre nuevo sugerido para la nueva estructura
 
-# --- CLASE CUSTOM (Mantenemos el fix de dimensiones) ---
+# --- CLASE CUSTOM MIGRADA AL NUEVO SDK ---
 class CustomGeminiEmbeddings(Embeddings):
-    def __init__(self, model_name="gemini-embedding-001", dimensionality=2048):
+    def __init__(self, model_name="gemini-embedding-001", dimensionality=2048, project=None, location=None):
         self.model_name = model_name
         self.dimensionality = dimensionality
-        self.client = TextEmbeddingModel.from_pretrained(model_name)
+        # Inicializamos el nuevo cliente unificado en modo VERTEX AI (Seguridad Enterprise)
+        self.client = genai.Client(vertexai=True, project=project, location=location)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        embeddings = []
-        batch_size = 20
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            inputs = [TextEmbeddingInput(text, "RETRIEVAL_DOCUMENT") for text in batch]
-            try:
-                results = self.client.get_embeddings(inputs, output_dimensionality=self.dimensionality)
-                embeddings.extend([embedding.values for embedding in results])
-            except Exception as e:
-                logger.error(f"Error generando embeddings nativos: {e}")
-                raise e
-        return embeddings
+        # El nuevo SDK acepta listas directamente y es más limpio
+        config = EmbedContentConfig(
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=self.dimensionality
+        )
+        try:
+            # Mandamos el lote (batch) de textos
+            response = self.client.models.embed_content(
+                model=self.model_name,
+                contents=texts,
+                config=config
+            )
+            # El objeto response.embeddings contiene la lista de vectores
+            return [embedding.values for embedding in response.embeddings]
+        except Exception as e:
+            logger.error(f"Error generando embeddings con nuevo SDK: {e}")
+            raise e
 
     def embed_query(self, text: str) -> List[float]:
-        inputs = [TextEmbeddingInput(text, "RETRIEVAL_QUERY")]
-        results = self.client.get_embeddings(inputs, output_dimensionality=self.dimensionality)
-        return results[0].values
+        config = EmbedContentConfig(
+            task_type="RETRIEVAL_QUERY",
+            output_dimensionality=self.dimensionality
+        )
+        response = self.client.models.embed_content(
+            model=self.model_name,
+            contents=text, # Aquí se manda un solo string
+            config=config
+        )
+        return response.embeddings[0].values
 
 # -----------------------------------------------------------
 
 def get_clients():
     global clients
     if 'firestore' not in clients:
-        logger.info("--- Inicializando clientes... ---")
+        logger.info("--- Inicializando clientes (Nuevo SDK google-genai)... ---")
         try:
             PROJECT_ID = os.environ.get("PROJECT_ID")
             VERTEX_AI_LOCATION = os.environ.get("VERTEX_AI_LOCATION", "us-central1")
             
-            vertexai.init(project=PROJECT_ID, location=VERTEX_AI_LOCATION)
-            
             clients['firestore'] = firestore.Client()
             clients['storage'] = storage.Client()
             
-            # Usamos el wrapper custom para 2048 dimensiones
+            # Usamos el wrapper custom actualizado
             clients['embedding'] = CustomGeminiEmbeddings(
                 model_name="gemini-embedding-001",
-                dimensionality=2048
+                dimensionality=2048,
+                project=PROJECT_ID,
+                location=VERTEX_AI_LOCATION
             )
             
-            # Modelo de Chat
+            # Nuevo modelo de Chat de LangChain compatible con el entorno Vertex
             MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             logger.info(f"Usando modelo LLM: {MODEL_NAME}")
-            clients['llm'] = ChatVertexAI(model_name=MODEL_NAME) 
+            # Al pasarle el project, LangChain sabe que debe enrutar por Vertex AI
+            clients['llm'] = ChatGoogleGenerativeAI(
+                model=MODEL_NAME, 
+                project=PROJECT_ID,
+                location=VERTEX_AI_LOCATION
+            ) 
             
             logger.info("--- Clientes inicializados. ---")
         except Exception as e:
