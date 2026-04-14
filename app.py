@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 clients = {}
 
-COLLECTION_NAME = "pida_knowledge_base_v1" # Nombre nuevo sugerido para la nueva estructura
+COLLECTION_NAME = "pida_kb_genai-v20" # Nombre nuevo sugerido para la nueva estructura
 
 # --- CLASE CUSTOM MIGRADA AL NUEVO SDK ---
 class CustomGeminiEmbeddings(Embeddings):
