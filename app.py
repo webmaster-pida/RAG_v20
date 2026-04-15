@@ -95,13 +95,10 @@ def get_clients():
             
             # Nuevo modelo de Chat de LangChain compatible con el entorno Vertex
             MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-            logger.info(f"Usando modelo LLM: {MODEL_NAME}")
-            # Al pasarle el project, LangChain sabe que debe enrutar por Vertex AI
-            clients['llm'] = ChatGoogleGenerativeAI(
-                model=MODEL_NAME, 
-                project=PROJECT_ID,
-                location=VERTEX_AI_LOCATION
-            ) 
+            logger.info(f"Usando modelo LLM nativo: {MODEL_NAME}")
+            # Usamos el cliente nativo unificado en modo Vertex para extracción
+            clients['genai_client'] = genai.Client(vertexai=True, project=PROJECT_ID, location=VERTEX_AI_LOCATION)
+            clients['llm_model_name'] = MODEL_NAME 
             
             logger.info("--- Clientes inicializados. ---")
         except Exception as e:
@@ -115,7 +112,8 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
         clients_local = get_clients()
         firestore_client = clients_local.get('firestore')
         embedding_model = clients_local.get('embedding')
-        llm = clients_local.get('llm') # Usaremos el LLM para extraer metadatos
+        genai_client = clients_local.get('genai_client')
+        llm_model_name = clients_local.get('llm_model_name')
         
         if not firestore_client or not embedding_model:
             raise Exception("Clientes GCP no disponibles.")
@@ -153,11 +151,14 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
             {sample_text}
             """
             
-            # Invocamos al modelo (ya inicializado en clients)
-            meta_response = llm.invoke(prompt_meta)
+            # Invocamos al modelo nativo de GenAI
+            meta_response = genai_client.models.generate_content(
+                model=llm_model_name,
+                contents=prompt_meta
+            )
             
-            # Limpiamos la respuesta para obtener solo el JSON
-            json_str = meta_response.content.replace("```json", "").replace("```", "").strip()
+            # Limpiamos la respuesta nativa para obtener solo el JSON
+            json_str = meta_response.text.replace("```json", "").replace("```", "").strip()
             metadata_extracted = json.loads(json_str)
             
             doc_title = metadata_extracted.get("title", filename)
