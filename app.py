@@ -215,7 +215,7 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
         # =========================================================================
         try:
             # Usamos la misma lógica del Frontend para asegurar que el ID coincida
-            safe_id = re.sub(r'[^a-zA-Z0-9]', '_', doc_title)[:50]
+            safe_id = re.sub(r'[^a-zA-Z0-9]', '_', doc_title)[:150]
             
             catalog_ref = firestore_client.collection("library_registry").document(safe_id)
             catalog_ref.set({
