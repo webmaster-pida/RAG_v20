@@ -5,6 +5,7 @@ import traceback
 import logging
 import tempfile
 import warnings
+import re # <-- NUEVO IMPORT NECESARIO PARA EL ID SEGURO
 
 # Filtramos advertencias de librerías
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
@@ -198,7 +199,7 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
             doc = Document(page_content=chunk.page_content, metadata=meta)
             documents.append(doc)
         
-        # 3. GUARDAR
+        # 3. GUARDAR VECTORES
         vector_store = FirestoreVectorStore(
             collection=COLLECTION_NAME, embedding_service=embedding_model, client=firestore_client
         )
@@ -208,6 +209,25 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
             batch = documents[i:i + batch_size]
             vector_store.add_documents(batch)
             logger.info(f"Lote {i//batch_size + 1} guardado.")
+            
+        # =========================================================================
+        # 4. NUEVO: GUARDAR EL REGISTRO EN EL CATÁLOGO GLOBAL (Costo: 1 escritura)
+        # =========================================================================
+        try:
+            # Usamos la misma lógica del Frontend para asegurar que el ID coincida
+            safe_id = re.sub(r'[^a-zA-Z0-9]', '_', doc_title)[:50]
+            
+            catalog_ref = firestore_client.collection("library_registry").document(safe_id)
+            catalog_ref.set({
+                "title": doc_title,
+                "author": doc_author,
+                "total_chunks": len(documents)
+            }, merge=True)
+            
+            logger.info(f"¡Éxito! Libro registrado en library_registry automáticamente con ID: {safe_id}")
+        except Exception as cat_err:
+            logger.error(f"Error guardando el registro en library_registry: {cat_err}")
+        # =========================================================================
         
         return {"status": "ok", "message": f"Archivo procesado: {doc_title} por {doc_author}"}
         
@@ -280,17 +300,12 @@ def query_rag_handler():
             raw_meta = doc.metadata
             
             # --- CORRECCIÓN DE ANIDAMIENTO ---
-            # A veces Firestore devuelve los campos directamente, a veces dentro de una llave 'metadata'.
-            # Verificamos si existe un diccionario interno llamado 'metadata' y lo usamos.
             inner_meta = raw_meta.get("metadata", {})
             if isinstance(inner_meta, dict) and inner_meta:
-                # Si hay datos anidados, damos prioridad a esos
                 data_source = inner_meta
             else:
-                # Si no, usamos el nivel superior
                 data_source = raw_meta
             
-            # Ahora extraemos los datos de la fuente correcta
             doc_source = data_source.get("source", "Desconocido")
             doc_title = data_source.get("title", data_source.get("Title", doc_source))
             doc_author = data_source.get("author", data_source.get("Author", "Autor Desconocido"))
