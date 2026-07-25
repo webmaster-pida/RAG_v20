@@ -5,7 +5,7 @@ import traceback
 import logging
 import tempfile
 import warnings
-import re # <-- NUEVO IMPORT NECESARIO PARA EL ID SEGURO
+import re 
 
 # Filtramos advertencias de librerías
 warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=FutureWarning)
@@ -13,18 +13,16 @@ warnings.filterwarnings("ignore", "Support for google-cloud-storage", category=F
 from flask import Flask, request, jsonify
 from typing import Dict, Any, List
 
-# LangChain y Google (Nuevas importaciones)
+# LangChain y Google
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
 from langchain_google_firestore import FirestoreVectorStore
 from google.cloud import firestore, storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
-# SDK GenAI unificado y LangChain GenAI
+# SDK GenAI unificado
 from google import genai
 from google.genai.types import EmbedContentConfig
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,30 +30,26 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 clients = {}
 
-COLLECTION_NAME = "pida_kb_genai-v20" # Nombre nuevo sugerido para la nueva estructura
+COLLECTION_NAME = "pida_kb_genai-v20" 
 
 # --- CLASE CUSTOM MIGRADA AL NUEVO SDK ---
 class CustomGeminiEmbeddings(Embeddings):
     def __init__(self, model_name="gemini-embedding-001", dimensionality=2048, project=None, location=None):
         self.model_name = model_name
         self.dimensionality = dimensionality
-        # Inicializamos el nuevo cliente unificado en modo VERTEX AI (Seguridad Enterprise)
         self.client = genai.Client(vertexai=True, project=project, location=location)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        # El nuevo SDK acepta listas directamente y es más limpio
         config = EmbedContentConfig(
             task_type="RETRIEVAL_DOCUMENT",
             output_dimensionality=self.dimensionality
         )
         try:
-            # Mandamos el lote (batch) de textos
             response = self.client.models.embed_content(
                 model=self.model_name,
                 contents=texts,
                 config=config
             )
-            # El objeto response.embeddings contiene la lista de vectores
             return [embedding.values for embedding in response.embeddings]
         except Exception as e:
             logger.error(f"Error generando embeddings con nuevo SDK: {e}")
@@ -68,7 +62,7 @@ class CustomGeminiEmbeddings(Embeddings):
         )
         response = self.client.models.embed_content(
             model=self.model_name,
-            contents=text, # Aquí se manda un solo string
+            contents=text, 
             config=config
         )
         return response.embeddings[0].values
@@ -86,7 +80,7 @@ def get_clients():
             clients['firestore'] = firestore.Client()
             clients['storage'] = storage.Client()
             
-            # Usamos el wrapper custom actualizado
+            # Usamos tu configuración superior comprobada
             clients['embedding'] = CustomGeminiEmbeddings(
                 model_name="gemini-embedding-001",
                 dimensionality=2048,
@@ -94,10 +88,9 @@ def get_clients():
                 location=VERTEX_AI_LOCATION
             )
             
-            # Nuevo modelo de Chat de LangChain compatible con el entorno Vertex
             MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
             logger.info(f"Usando modelo LLM nativo: {MODEL_NAME}")
-            # Usamos el cliente nativo unificado en modo Vertex para extracción
+            
             clients['genai_client'] = genai.Client(vertexai=True, project=PROJECT_ID, location=VERTEX_AI_LOCATION)
             clients['llm_model_name'] = MODEL_NAME 
             
@@ -119,87 +112,99 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
         if not firestore_client or not embedding_model:
             raise Exception("Clientes GCP no disponibles.")
         
-        # Verificar si ya existe (Opcional: podrías querer sobrescribir)
         docs_ref = firestore_client.collection(COLLECTION_NAME)
         existing_docs = docs_ref.where(filter=FieldFilter("metadata.source", "==", filename)).limit(1).stream()
         if len(list(existing_docs)) > 0:
-            logger.warning(f"El archivo {filename} ya existe. Saltando o podrías borrarlo aquí para re-indexar.")
+            logger.warning(f"El archivo {filename} ya existe. Saltando...")
             return {"status": "skipped", "message": "Archivo ya existe en la base de datos."}
 
-        # 1. LEER TEXTO PLANO
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             text_content = f.read()
         
         if not text_content:
             return {"status": "error", "reason": "El archivo está vacío."}
 
-        # --- NUEVO: EXTRACCIÓN INTELIGENTE DE METADATOS ---
+        # 1. EXTRACCIÓN DE METADATOS 
         doc_title = filename
         doc_author = "Desconocido"
         
         try:
-            # Tomamos una muestra del inicio donde suele estar el título/autor
             sample_text = text_content[:3000]
-            
             prompt_meta = f"""Eres un bibliotecario experto. Analiza el siguiente fragmento de texto y extrae el Título y el Autor.
-            
             Reglas:
             1. Si no encuentras el autor explícitamente, pon "Autor Desconocido".
             2. Si no encuentras el título claro, usa: "{filename}".
             3. Responde ÚNICAMENTE un JSON válido con este formato: {{"title": "...", "author": "..."}}
-            
             TEXTO:
             {sample_text}
             """
             
-            # Invocamos al modelo nativo de GenAI
             meta_response = genai_client.models.generate_content(
                 model=llm_model_name,
                 contents=prompt_meta
             )
             
-            # Limpiamos la respuesta nativa para obtener solo el JSON
             json_str = meta_response.text.replace("```json", "").replace("```", "").strip()
             metadata_extracted = json.loads(json_str)
             
             doc_title = metadata_extracted.get("title", filename)
             doc_author = metadata_extracted.get("author", "Autor Desconocido")
-            
             logger.info(f"METADATOS EXTRAÍDOS: Título='{doc_title}', Autor='{doc_author}'")
             
         except Exception as e:
             logger.warning(f"No se pudieron extraer metadatos con IA, usando defaults: {e}")
-        # ----------------------------------------------------
 
-        # 2. PROCESAMIENTO (SPLITTING)
-        headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
-        markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-        md_header_splits = markdown_splitter.split_text(text_content)
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2000, 
-            chunk_overlap=200,
-            separators=["\n\n", "\n", " ", ""]
-        )
+        # 2. PROCESAMIENTO INTELIGENTE (REGEX SPLITTING CORTE IDH)
+        logger.info("Aplicando Regex Chunking para sentencias legales...")
         
-        chunks = text_splitter.split_documents(md_header_splits)
+        patron_parrafo = r'\n(?=\d{1,4}\.\s)'
+        fragmentos_crudos = re.split(patron_parrafo, text_content)
         
-        # Preparar documentos para Firestore CON LOS NUEVOS METADATOS
         documents = []
-        for i, chunk in enumerate(chunks):
-            meta = chunk.metadata.copy()
-            meta.update({
-                "source": filename,
-                "title": doc_title,   # <--- AQUI GUARDAMOS EL TÍTULO
-                "author": doc_author, # <--- AQUI GUARDAMOS EL AUTOR
-                "chunk_index": i,
-                "model": "gemini-embedding-001"
-            })
-            
-            doc = Document(page_content=chunk.page_content, metadata=meta)
-            documents.append(doc)
+        contexto_actual_h1 = "Sin Título Principal"
+        contexto_actual_h2 = "Sin Capítulo"
+        contexto_actual_h3 = "Sin Subsección"
+        chunk_index = 0
         
-        # 3. GUARDAR VECTORES
+        for fragmento in fragmentos_crudos:
+            fragmento = fragmento.strip()
+            if not fragmento: 
+                continue
+                
+            lineas = fragmento.split('\n')
+            for linea in lineas:
+                linea_limpia = linea.strip()
+                if linea_limpia.startswith('# '):
+                    contexto_actual_h1 = linea_limpia.replace('# ', '').strip()
+                elif linea_limpia.startswith('## '):
+                    contexto_actual_h2 = linea_limpia.replace('## ', '').strip()
+                    contexto_actual_h3 = "" 
+                elif linea_limpia.startswith('### '):
+                    contexto_actual_h3 = linea_limpia.replace('### ', '').strip()
+                    
+            if len(fragmento) < 40 and not re.match(r'^\d{1,4}\.', fragmento):
+                continue
+                
+            match_num = re.match(r'^(\d{1,4})\.', fragmento)
+            num_parrafo = int(match_num.group(1)) if match_num else None
+            
+            meta = {
+                "source": filename,
+                "title": doc_title,   
+                "author": doc_author, 
+                "seccion_h1": contexto_actual_h1,
+                "seccion_h2": contexto_actual_h2,
+                "subseccion_h3": contexto_actual_h3,
+                "numero_parrafo": num_parrafo,
+                "chunk_index": chunk_index,
+                "model": "gemini-embedding-001"
+            }
+            
+            doc = Document(page_content=fragmento, metadata=meta)
+            documents.append(doc)
+            chunk_index += 1
+        
+        # 3. GUARDAR VECTORES EN FIRESTORE
         vector_store = FirestoreVectorStore(
             collection=COLLECTION_NAME, embedding_service=embedding_model, client=firestore_client
         )
@@ -210,26 +215,20 @@ def _process_and_embed_text_file(file_path: str, filename: str) -> Dict[str, Any
             vector_store.add_documents(batch)
             logger.info(f"Lote {i//batch_size + 1} guardado.")
             
-        # =========================================================================
-        # 4. NUEVO: GUARDAR EL REGISTRO EN EL CATÁLOGO GLOBAL (Costo: 1 escritura)
-        # =========================================================================
+        # 4. GUARDAR EL REGISTRO EN EL CATÁLOGO GLOBAL
         try:
-            # Usamos la misma lógica del Frontend para asegurar que el ID coincida
             safe_id = re.sub(r'[^a-zA-Z0-9]', '_', doc_title)[:150]
-            
             catalog_ref = firestore_client.collection("library_registry").document(safe_id)
             catalog_ref.set({
                 "title": doc_title,
                 "author": doc_author,
                 "total_chunks": len(documents)
             }, merge=True)
-            
-            logger.info(f"¡Éxito! Libro registrado en library_registry automáticamente con ID: {safe_id}")
+            logger.info(f"¡Éxito! Libro registrado en library_registry con ID: {safe_id}")
         except Exception as cat_err:
             logger.error(f"Error guardando el registro en library_registry: {cat_err}")
-        # =========================================================================
         
-        return {"status": "ok", "message": f"Archivo procesado: {doc_title} por {doc_author}"}
+        return {"status": "ok", "message": f"Archivo procesado: {doc_title} por {doc_author} ({len(documents)} vectores)"}
         
     except Exception as e:
         logger.error(f"Error procesando Texto/MD: {e}", exc_info=True)
@@ -246,11 +245,10 @@ def handle_gcs_event():
         if not event: return "Sin body", 400
 
         bucket_name = event.get("bucket")
-        file_id = event.get("name") # ej: "carpeta/documento.md"
+        file_id = event.get("name") 
         
         if not bucket_name or not file_id: return "Evento ignorado", 200
 
-        # FILTRO: Solo procesar .txt o .md (opcional)
         if not (file_id.endswith(".txt") or file_id.endswith(".md")):
             logger.info(f"Archivo {file_id} ignorado (no es txt/md).")
             return "Formato no soportado", 200
@@ -264,7 +262,6 @@ def handle_gcs_event():
             blob.download_to_filename(temp_file.name)
             temp_file.close()
             try:
-                # Llamamos a la nueva función de texto
                 result = _process_and_embed_text_file(temp_file.name, file_id)
             finally:
                 if os.path.exists(temp_file.name): os.unlink(temp_file.name)
@@ -296,10 +293,8 @@ def query_rag_handler():
         
         results = []
         for i, doc in enumerate(found_docs):
-            # Obtenemos la metadata cruda
             raw_meta = doc.metadata
             
-            # --- CORRECCIÓN DE ANIDAMIENTO ---
             inner_meta = raw_meta.get("metadata", {})
             if isinstance(inner_meta, dict) and inner_meta:
                 data_source = inner_meta
@@ -309,7 +304,6 @@ def query_rag_handler():
             doc_source = data_source.get("source", "Desconocido")
             doc_title = data_source.get("title", data_source.get("Title", doc_source))
             doc_author = data_source.get("author", data_source.get("Author", "Autor Desconocido"))
-            # ----------------------------------
 
             results.append({
                 "source": doc_source,
